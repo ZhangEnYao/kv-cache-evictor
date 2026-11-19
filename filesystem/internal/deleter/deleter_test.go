@@ -312,6 +312,73 @@ func TestModelName(t *testing.T) {
 	}
 }
 
+// vLLMSha256Name is the file vLLM writes for the first 16-token block of the
+// prompt 0..15 with the default sha256 prefix-caching hash: the full 32-byte
+// hash in hex (vllm/v1/kv_offload/file_mapper.py). vLLMSha256EventHash is the
+// hash vLLM's KV events carry for that block: int.from_bytes(hash, "big") &
+// (2**64 - 1) (maybe_convert_block_hash in vllm/v1/core/kv_cache_utils.py).
+const (
+	vLLMSha256Name      = "fe8fa5dda3210d0ca2031e37cbe3b001186773cd1c710beb2d45fcb51d434798.bin"
+	vLLMSha256EventHash = 0x2d45fcb51d434798
+)
+
+func TestBlockHashFromPath(t *testing.T) {
+	tests := []struct {
+		name   string
+		file   string
+		want   uint64
+		wantOK bool
+	}{
+		{name: "sha256 name (vLLM default)", file: vLLMSha256Name, want: vLLMSha256EventHash, wantOK: true},
+		{name: "xxh3_128 name", file: "c4bc45508fc28b0cea995db5e59ae36b.bin", want: 0xea995db5e59ae36b, wantOK: true},
+		{name: "64-bit name", file: "0000000000000001.bin", want: 1, wantOK: true},
+		{name: "not a bin file", file: "0000000000000001.tmp"},
+		{name: "too short", file: "00000001.bin"},
+		{name: "odd length", file: "00000000000000001.bin"},
+		{name: "non-hex before the low 64 bits", file: "zz8fa5dda3210d0ca2031e37cbe3b001186773cd1c710beb2d45fcb51d434798.bin"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := blockHashFromPath(filepath.Join("/cache", "model_r0", "fe8", "fa_g0", tt.file))
+			if ok != tt.wantOK || got != tt.want {
+				t.Fatalf("blockHashFromPath(%q) = %#x, %v; want %#x, %v", tt.file, got, ok, tt.want, tt.wantOK)
+			}
+		})
+	}
+}
+
+func TestFlushPublishesHashOfVLLMSha256File(t *testing.T) {
+	root := t.TempDir()
+	cachePath := filepath.Join(root, "cache")
+	metadataDir := filepath.Join(cachePath, "model_digest")
+	if err := os.MkdirAll(metadataDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(metadataDir, "config.json"), []byte(`{"model_name":"test-model"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bucket := filepath.Join(cachePath, "model_digest_r0", "fe8", "fa_g0")
+	if err := os.MkdirAll(bucket, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	filePath := filepath.Join(bucket, vLLMSha256Name)
+	if err := os.WriteFile(filePath, []byte("cache"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	publisher := &recordingPublisher{hashes: map[string][]uint64{}}
+	cfg := &config.Config{PVCMountPath: root, CacheDirectory: "cache"}
+	deleter, _ := newTestDeleter(cfg, publisher)
+	deleter.flush(context.Background(), []string{filePath}, make(chan string, 1), slog.New(slog.DiscardHandler))
+
+	if _, err := os.Stat(filePath); !os.IsNotExist(err) {
+		t.Fatalf("file still exists after deletion: %v", err)
+	}
+	if got := publisher.hashes["test-model"]; len(got) != 1 || got[0] != vLLMSha256EventHash {
+		t.Fatalf("published hashes = %#x, want [%#x]", got, uint64(vLLMSha256EventHash))
+	}
+}
+
 func TestFlushDisablesEventsAfterMetadataRetries(t *testing.T) {
 	originalRetryDelay := metadataRetryDelay
 	metadataRetryDelay = 0

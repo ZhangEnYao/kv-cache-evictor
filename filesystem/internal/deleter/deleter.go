@@ -2,13 +2,14 @@ package deleter
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -294,17 +295,27 @@ func (d *Deleter) logStopped(logger *slog.Logger) {
 	)
 }
 
+// eventHashBytes is the size of the block hash in vLLM's KV events.
+const eventHashBytes = 8
+
+// blockHashFromPath returns the block hash that a cache file name encodes, in
+// the form vLLM's KV events carry it.
+//
+// vLLM names each file after its full block hash in hex: 32 bytes for sha256
+// (the default prefix-caching hash) and 16 for xxhash (xxh3_128). With
+// VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=1 (the default), its events carry
+// int.from_bytes(hash, "big") & (2**64 - 1), which is the last 8 bytes of the
+// hash read big-endian. An 8-byte name maps to itself.
 func blockHashFromPath(path string) (uint64, bool) {
-	base := filepath.Base(path)
-	if !strings.HasSuffix(base, ".bin") {
+	name, ok := strings.CutSuffix(filepath.Base(path), ".bin")
+	if !ok {
 		return 0, false
 	}
-	value := strings.TrimSuffix(base, ".bin")
-	if len(value) != 16 {
+	hash, err := hex.DecodeString(name)
+	if err != nil || len(hash) < eventHashBytes {
 		return 0, false
 	}
-	parsed, err := strconv.ParseUint(value, 16, 64)
-	return parsed, err == nil
+	return binary.BigEndian.Uint64(hash[len(hash)-eventHashBytes:]), true
 }
 
 var rankDirPattern = regexp.MustCompile(`^(.+)_r\d+$`)

@@ -98,6 +98,7 @@ It exits if either path does not appear.
 
 When `STORAGE_EVENTS_ENDPOINT` is set, the service opens a ZMQ PUB socket and publishes events after successful deletions.
 The topic is `kv@SHARED_STORAGE@<model-name>`. The model name is read from the model's `config.json` file.
+Each removed block is reported by the low 64 bits of the hash in its file name, which are the last 16 hex characters. vLLM names files after the full block hash (64 hex characters for sha256, 32 for xxhash), and its own KV events carry the same low 64 bits when `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=1`, the default.
 If that metadata cannot be read after retries, the service continues deleting files but disables event publishing.
 
 ## Development
