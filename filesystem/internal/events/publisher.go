@@ -57,13 +57,16 @@ type Options struct {
 	// the topic, medium and group of the STORAGE events the pod published.
 	PodHosts []string
 	PodPorts []string
+	// ModelNames maps a config.json model_name to the topic model name.
+	ModelNames map[string]string
 }
 
 type Publisher struct {
-	socket      zmq4.Socket
+	sockets     []zmq4.Socket
 	stopDialing context.CancelFunc
 	dialing     sync.WaitGroup
 	pods        *podResolver
+	modelNames  map[string]string
 	sequence    uint64
 	lastPublish time.Time
 	mutex       sync.Mutex
@@ -71,54 +74,76 @@ type Publisher struct {
 
 // NewPublisher opens the PUB socket. An endpoint with a wildcard host
 // (tcp://*:5570) or an ipc:// or inproc:// address is bound, as vLLM's
-// ZmqEventPublisher binds tcp://*:5557. Any other endpoint is connected to.
+// ZmqEventPublisher binds tcp://*:5557. Any other endpoint is connected to,
+// and endpoint may then list several comma-separated endpoints, for example
+// one per router replica.
 // Connecting does not wait for the peer: the socket keeps retrying in the
 // background and reconnects after a lost connection. Events sent while no
 // peer is connected are dropped.
 func NewPublisher(ctx context.Context, endpoint string, options Options) (*Publisher, error) {
-	var pods *podResolver
-	if len(options.PodHosts) > 0 {
-		pods = newPodResolver(options.PodHosts, options.PodPorts)
+	var endpoints []string
+	for item := range strings.SplitSeq(endpoint, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			endpoints = append(endpoints, item)
+		}
+	}
+	if len(endpoints) == 0 {
+		return nil, fmt.Errorf("no ZMQ endpoint in %q", endpoint)
 	}
 
-	if isBindEndpoint(endpoint) {
+	publisher := &Publisher{modelNames: options.ModelNames}
+	if len(options.PodHosts) > 0 {
+		publisher.pods = newPodResolver(options.PodHosts, options.PodPorts)
+	}
+
+	if len(endpoints) == 1 && isBindEndpoint(endpoints[0]) {
 		socket := zmq4.NewPub(ctx)
 		if err := socket.SetOption(zmq4.OptionHWM, sendHighWaterMark); err != nil {
 			_ = socket.Close()
 			return nil, fmt.Errorf("set ZMQ send high-water mark: %w", err)
 		}
-		if err := socket.Listen(endpoint); err != nil {
+		if err := socket.Listen(endpoints[0]); err != nil {
 			_ = socket.Close()
-			return nil, fmt.Errorf("listen on ZMQ endpoint %q: %w", endpoint, err)
+			return nil, fmt.Errorf("listen on ZMQ endpoint %q: %w", endpoints[0], err)
 		}
-		return &Publisher{socket: socket, pods: pods}, nil
+		publisher.sockets = []zmq4.Socket{socket}
+		return publisher, nil
 	}
 
 	dialCtx, stopDialing := context.WithCancel(ctx)
-	socket := zmq4.NewPub(dialCtx,
-		zmq4.WithDialerRetry(dialRetryInterval),
-		zmq4.WithDialerMaxRetries(-1),
-		zmq4.WithAutomaticReconnect(true),
-	)
-	if err := socket.SetOption(zmq4.OptionHWM, sendHighWaterMark); err != nil {
-		stopDialing()
-		_ = socket.Close()
-		return nil, fmt.Errorf("set ZMQ send high-water mark: %w", err)
-	}
-	publisher := &Publisher{socket: socket, stopDialing: stopDialing, pods: pods}
-	publisher.dialing.Add(1)
-	go func() {
-		defer publisher.dialing.Done()
-		for dialCtx.Err() == nil {
-			if socket.Dial(endpoint) == nil {
-				return
-			}
-			select {
-			case <-dialCtx.Done():
-			case <-time.After(dialRetryInterval):
-			}
+	publisher.stopDialing = stopDialing
+	for _, item := range endpoints {
+		if isBindEndpoint(item) {
+			_ = publisher.closeSockets()
+			return nil, fmt.Errorf("bind endpoint %q must be the only endpoint", item)
 		}
-	}()
+		// zmq4 redials the socket's last dialed endpoint after a lost
+		// connection, so each endpoint gets a socket of its own.
+		socket := zmq4.NewPub(dialCtx,
+			zmq4.WithDialerRetry(dialRetryInterval),
+			zmq4.WithDialerMaxRetries(-1),
+			zmq4.WithAutomaticReconnect(true),
+		)
+		if err := socket.SetOption(zmq4.OptionHWM, sendHighWaterMark); err != nil {
+			_ = socket.Close()
+			_ = publisher.closeSockets()
+			return nil, fmt.Errorf("set ZMQ send high-water mark: %w", err)
+		}
+		publisher.sockets = append(publisher.sockets, socket)
+		publisher.dialing.Add(1)
+		go func() {
+			defer publisher.dialing.Done()
+			for dialCtx.Err() == nil {
+				if socket.Dial(item) == nil {
+					return
+				}
+				select {
+				case <-dialCtx.Done():
+				case <-time.After(dialRetryInterval):
+				}
+			}
+		}()
+	}
 	return publisher, nil
 }
 
@@ -146,10 +171,14 @@ func (p *Publisher) PublishBlocksRemoved(ctx context.Context, removed BlocksRemo
 	if len(removed.BlockHashes) == 0 || removed.ModelName == "" {
 		return nil
 	}
+	modelName := removed.ModelName
+	if mapped, ok := p.modelNames[modelName]; ok {
+		modelName = mapped
+	}
 
 	if p.pods == nil {
 		event := []any{"BlockRemoved", removed.BlockHashes, sharedStorage}
-		return p.send([]string{"kv@" + sharedStorage + "@" + removed.ModelName}, event)
+		return p.send([]string{"kv@" + sharedStorage + "@" + modelName}, event)
 	}
 
 	if !removed.HasGroup {
@@ -158,7 +187,7 @@ func (p *Publisher) PublishBlocksRemoved(ctx context.Context, removed BlocksRemo
 	pods, resolveErr := p.pods.endpoints(ctx)
 	topics := make([]string, 0, len(pods))
 	for _, pod := range pods {
-		topics = append(topics, "kv@"+pod+"@"+removed.ModelName)
+		topics = append(topics, "kv@"+pod+"@"+modelName)
 	}
 	event := []any{"BlockRemoved", removed.BlockHashes, storageMedium, removed.GroupIdx}
 	return errors.Join(resolveErr, p.send(topics, event))
@@ -179,7 +208,7 @@ func (p *Publisher) send(topics []string, event []any) error {
 
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
-	if p.socket == nil {
+	if p.sockets == nil {
 		return nil
 	}
 	var errs []error
@@ -187,8 +216,10 @@ func (p *Publisher) send(topics []string, event []any) error {
 		p.sequence++
 		sequence := make([]byte, binary.Size(uint64(0)))
 		binary.BigEndian.PutUint64(sequence, p.sequence)
-		if err := p.socket.Send(zmq4.NewMsgFrom([]byte(topic), sequence, payload)); err != nil {
-			errs = append(errs, err)
+		for _, socket := range p.sockets {
+			if err := socket.Send(zmq4.NewMsgFrom([]byte(topic), sequence, payload)); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 	p.lastPublish = time.Now()
@@ -205,18 +236,26 @@ func (p *Publisher) send(topics []string, event []any) error {
 func (p *Publisher) Close() error {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
-	if p.socket == nil {
+	if p.sockets == nil {
 		return nil
 	}
 	if wait := closeDrainDelay - time.Since(p.lastPublish); wait > 0 {
 		time.Sleep(wait)
 	}
+	return p.closeSockets()
+}
+
+func (p *Publisher) closeSockets() error {
 	if p.stopDialing != nil {
 		p.stopDialing()
 	}
-	socket := p.socket
-	p.socket = nil
-	err := socket.Close()
+	var errs []error
+	for _, socket := range p.sockets {
+		if err := socket.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	p.sockets = nil
 	p.dialing.Wait()
-	return err
+	return errors.Join(errs...)
 }

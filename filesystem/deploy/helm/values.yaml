@@ -94,6 +94,9 @@ events:
   podHosts: ""
   # STORAGE_EVENTS_POD_PORTS. Comma-separated vLLM serving ports.
   podPorts: "8000"
+  # STORAGE_EVENTS_MODEL_NAMES. Comma-separated config.json model_name=topic
+  # model pairs.
+  modelNames: ""
 
   service:
     # Creates a Service and containerPort for the event endpoint in standalone

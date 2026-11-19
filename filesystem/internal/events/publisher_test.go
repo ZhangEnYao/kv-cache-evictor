@@ -173,20 +173,52 @@ func assertBlockRemovedMessage(t *testing.T, message zmq4.Msg) {
 
 func TestIsBindEndpoint(t *testing.T) {
 	for endpoint, want := range map[string]bool{
-		"tcp://*:5570":                   true,
-		"tcp://0.0.0.0:5570":             true,
-		"tcp://[::]:5570":                true,
-		"ipc:///tmp/events":              true,
-		"inproc://events":                true,
-		"tcp://epp.llm-d.svc:5570":       false,
-		"tcp://10.0.0.7:5570":            false,
-		"tcp://epp-0.epp.llm-d.svc:5570": false,
-		"tcp://[fd00::7]:5570":           false,
+		"tcp://*:5570":                    true,
+		"tcp://[::]:5570":                 true,
+		"ipc:///tmp/events":               true,
+		"inproc://events":                 true,
+		"tcp://epp.llm-d.svc:5570":        false,
+		"tcp://10.0.0.7:5570":             false,
+		"tcp://epp-0.epp.llm-d.svc:5570":  false,
+		"tcp://[fd00::7]:5570":            false,
+		"tcp://0.0.0.0:5570":              true,
+		"tcp://localhost.localdomain:557": false,
 	} {
 		if got := isBindEndpoint(endpoint); got != want {
 			t.Errorf("isBindEndpoint(%q) = %v, want %v", endpoint, got, want)
 		}
 	}
+}
+
+func TestNewPublisherRejectsBindEndpointInList(t *testing.T) {
+	if _, err := NewPublisher(context.Background(), "tcp://epp:5570,tcp://*:5571", Options{}); err == nil {
+		t.Fatal("bind endpoint in a list was accepted")
+	}
+}
+
+// receive collects messages from subscriber until it has want of them.
+func receive(t *testing.T, ctx context.Context, subscriber zmq4.Socket, want int) []zmq4.Msg {
+	t.Helper()
+	messages := make(chan zmq4.Msg, want)
+	go func() {
+		for range want {
+			message, err := subscriber.Recv()
+			if err != nil {
+				return
+			}
+			messages <- message
+		}
+	}()
+	var got []zmq4.Msg
+	for len(got) < want {
+		select {
+		case message := <-messages:
+			got = append(got, message)
+		case <-ctx.Done():
+			t.Fatalf("received %d messages, want %d", len(got), want)
+		}
+	}
+	return got
 }
 
 func decodeEvent(t *testing.T, payload []byte) []any {
@@ -206,8 +238,7 @@ func decodeEvent(t *testing.T, payload []byte) []any {
 	return event
 }
 
-// The llm-d router's kvEventsConfig.zmqEndpoint binds, so the evictor must
-// connect to it.
+// The router's global socket binds, so the evictor must connect to it.
 func TestPublisherConnectsToBoundSubscriberAndReconnects(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -238,13 +269,12 @@ func TestPublisherConnectsToBoundSubscriberAndReconnects(t *testing.T) {
 		ticker := time.NewTicker(50 * time.Millisecond)
 		defer ticker.Stop()
 		for {
-			if err := publisher.PublishBlocksRemoved(ctx, BlocksRemoved{ModelName: "test-model", BlockHashes: []uint64{hash}}); err != nil {
+			if err := publisher.PublishBlocksRemoved(ctx, BlocksRemoved{ModelName: "m", BlockHashes: []uint64{hash}}); err != nil {
 				t.Fatal(err)
 			}
 			select {
 			case message := <-got:
-				hashes, _ := decodeEvent(t, message.Frames[2])[1].([]any)
-				if len(hashes) != 1 || hashes[0] != hash {
+				if hashes := decodeEvent(t, message.Frames[2])[1].([]any); hashes[0] != hash {
 					t.Fatalf("hashes = %v, want [%d]", hashes, hash)
 				}
 				return
@@ -270,39 +300,15 @@ func TestPublisherConnectsToBoundSubscriberAndReconnects(t *testing.T) {
 	publishUntilReceived(restarted, 2)
 }
 
-// receive collects messages from subscriber until it has want of them.
-func receive(t *testing.T, ctx context.Context, subscriber zmq4.Socket, want int) []zmq4.Msg {
-	t.Helper()
-	messages := make(chan zmq4.Msg, want)
-	go func() {
-		for range want {
-			message, err := subscriber.Recv()
-			if err != nil {
-				return
-			}
-			messages <- message
-		}
-	}()
-	var got []zmq4.Msg
-	for len(got) < want {
-		select {
-		case message := <-messages:
-			got = append(got, message)
-		case <-ctx.Done():
-			t.Fatalf("received %d messages, want %d", len(got), want)
-		}
-	}
-	return got
-}
-
 func TestPublisherSendsOneStorageEventPerPod(t *testing.T) {
 	endpoint := "inproc://pvc-evictor-per-pod-test"
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	publisher, err := NewPublisher(ctx, endpoint, Options{
-		PodHosts: []string{"10.0.0.6", "10.0.0.5"},
-		PodPorts: []string{"8000"},
+		PodHosts:   []string{"10.0.0.6", "10.0.0.5"},
+		PodPorts:   []string{"8000"},
+		ModelNames: map[string]string{"/models/qwen3-8b": "Qwen/Qwen3-8B"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -319,7 +325,7 @@ func TestPublisherSendsOneStorageEventPerPod(t *testing.T) {
 	}
 	time.Sleep(100 * time.Millisecond)
 
-	removed := BlocksRemoved{ModelName: "Qwen/Qwen3-8B", GroupIdx: 1, HasGroup: true, BlockHashes: []uint64{7, 8}}
+	removed := BlocksRemoved{ModelName: "/models/qwen3-8b", GroupIdx: 1, HasGroup: true, BlockHashes: []uint64{7, 8}}
 	if err := publisher.PublishBlocksRemoved(ctx, removed); err != nil {
 		t.Fatal(err)
 	}

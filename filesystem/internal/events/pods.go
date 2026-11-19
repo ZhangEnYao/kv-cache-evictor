@@ -6,7 +6,13 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"sync"
+	"time"
 )
+
+// podCacheTTL is how long one resolution of the pod hosts is reused. It keeps
+// a busy deleter from sending a DNS query for every batch.
+const podCacheTTL = 5 * time.Second
 
 // podResolver turns the configured pod hosts into the identifiers the
 // llm-d router's KV-cache index uses for vLLM pods. The router's pod discovery
@@ -16,6 +22,11 @@ type podResolver struct {
 	hosts      []string
 	ports      []string
 	lookupHost func(ctx context.Context, host string) ([]string, error)
+	now        func() time.Time
+
+	mutex   sync.Mutex
+	cached  []string
+	expires time.Time
 }
 
 func newPodResolver(hosts, ports []string) *podResolver {
@@ -23,6 +34,7 @@ func newPodResolver(hosts, ports []string) *podResolver {
 		hosts:      hosts,
 		ports:      ports,
 		lookupHost: net.DefaultResolver.LookupHost,
+		now:        time.Now,
 	}
 }
 
@@ -32,6 +44,12 @@ func newPodResolver(hosts, ports []string) *podResolver {
 // resolved, the identifiers of the other hosts are still returned with the
 // error.
 func (r *podResolver) endpoints(ctx context.Context) ([]string, error) {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	if r.cached != nil && r.now().Before(r.expires) {
+		return r.cached, nil
+	}
+
 	seen := make(map[string]struct{})
 	var ips []string
 	add := func(address string) {
@@ -66,5 +84,10 @@ func (r *podResolver) endpoints(ctx context.Context) ([]string, error) {
 			endpoints = append(endpoints, ip+":"+port)
 		}
 	}
-	return endpoints, errors.Join(errs...)
+	if len(errs) > 0 {
+		return endpoints, errors.Join(errs...)
+	}
+	r.cached = endpoints
+	r.expires = r.now().Add(podCacheTTL)
+	return endpoints, nil
 }

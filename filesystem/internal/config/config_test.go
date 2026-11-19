@@ -308,6 +308,7 @@ func TestStorageEventsPodSettings(t *testing.T) {
 	t.Setenv("STORAGE_EVENTS_ENDPOINT", "tcp://epp.llm-d.svc:5570")
 	t.Setenv("STORAGE_EVENTS_POD_HOSTS", " vllm-pods.llm-d.svc , 10.0.0.5 ")
 	t.Setenv("STORAGE_EVENTS_POD_PORTS", "8000,8001")
+	t.Setenv("STORAGE_EVENTS_MODEL_NAMES", "/models/qwen3-8b=Qwen/Qwen3-8B")
 
 	cfg, err := FromEnv()
 	if err != nil {
@@ -318,6 +319,9 @@ func TestStorageEventsPodSettings(t *testing.T) {
 	}
 	if got := cfg.StorageEventsPodPorts; len(got) != 2 || got[0] != "8000" || got[1] != "8001" {
 		t.Fatalf("pod ports = %q", got)
+	}
+	if got := cfg.StorageEventsModelNames["/models/qwen3-8b"]; got != "Qwen/Qwen3-8B" {
+		t.Fatalf("model names = %v", cfg.StorageEventsModelNames)
 	}
 }
 
@@ -338,6 +342,7 @@ func TestStorageEventsPodSettingsRejected(t *testing.T) {
 		"hosts without endpoint": {"STORAGE_EVENTS_POD_HOSTS": "vllm-pods"},
 		"bad port":               {"STORAGE_EVENTS_ENDPOINT": "tcp://epp:5570", "STORAGE_EVENTS_POD_HOSTS": "vllm-pods", "STORAGE_EVENTS_POD_PORTS": "http"},
 		"port out of range":      {"STORAGE_EVENTS_ENDPOINT": "tcp://epp:5570", "STORAGE_EVENTS_POD_HOSTS": "vllm-pods", "STORAGE_EVENTS_POD_PORTS": "70000"},
+		"model pair":             {"STORAGE_EVENTS_MODEL_NAMES": "qwen"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			for key, value := range env {

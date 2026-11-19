@@ -62,6 +62,9 @@ type Config struct {
 	// StorageEventsPodPorts lists the serving ports of each pod, as the
 	// InferencePool's target ports name them.
 	StorageEventsPodPorts []string
+	// StorageEventsModelNames maps a config.json model_name to the model name
+	// in vLLM's KV-event topic, for deployments where the two differ.
+	StorageEventsModelNames map[string]string
 }
 
 func FromEnv() (Config, error) {
@@ -113,6 +116,9 @@ func FromEnvAndFlags(args []string) (Config, error) {
 	)
 	storageEventsPodPorts := flags.String(
 		"storage-events-pod-ports", DefaultStorageEventsPodPorts, "comma-separated vLLM serving ports",
+	)
+	storageEventsModelNames := flags.String(
+		"storage-events-model-names", "", "comma-separated config.json model_name=topic model name pairs",
 	)
 
 	if err := flags.Parse(args); err != nil {
@@ -202,6 +208,13 @@ func FromEnvAndFlags(args []string) (Config, error) {
 		return Config{}, fmt.Errorf("invalid ENABLE_DIR_CLEANUP: %w", err)
 	}
 
+	modelNames, err := parseModelNames(stringSetting(
+		flags, "storage-events-model-names", *storageEventsModelNames, "STORAGE_EVENTS_MODEL_NAMES", "",
+	))
+	if err != nil {
+		return Config{}, fmt.Errorf("invalid STORAGE_EVENTS_MODEL_NAMES: %w", err)
+	}
+
 	cfg := Config{
 		PVCMountPath:              stringSetting(flags, "pvc-mount-path", *pvcMountPath, "PVC_MOUNT_PATH", DefaultPVCMountPath),
 		CacheDirectory:            stringSetting(flags, "cache-directory", *cacheDirectory, "CACHE_DIRECTORY", DefaultCacheDirectory),
@@ -237,6 +250,7 @@ func FromEnvAndFlags(args []string) (Config, error) {
 			"STORAGE_EVENTS_POD_PORTS",
 			DefaultStorageEventsPodPorts,
 		)),
+		StorageEventsModelNames: modelNames,
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -357,6 +371,24 @@ func splitList(value string) []string {
 		}
 	}
 	return items
+}
+
+// parseModelNames parses comma-separated from=to pairs.
+func parseModelNames(value string) (map[string]string, error) {
+	items := splitList(value)
+	if len(items) == 0 {
+		return nil, nil
+	}
+	names := make(map[string]string, len(items))
+	for _, item := range items {
+		from, to, ok := strings.Cut(item, "=")
+		from, to = strings.TrimSpace(from), strings.TrimSpace(to)
+		if !ok || from == "" || to == "" {
+			return nil, fmt.Errorf("%q is not a model_name=topic_model pair", item)
+		}
+		names[from] = to
+	}
+	return names, nil
 }
 
 func validCrawlerCount(count int) bool {

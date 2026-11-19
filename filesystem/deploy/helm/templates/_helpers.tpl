@@ -52,6 +52,7 @@ LOG_FILE_PATH: {{ .Values.settings.logFilePath | quote }}
 STORAGE_EVENTS_ENDPOINT: {{ .Values.events.endpoint | quote }}
 STORAGE_EVENTS_POD_HOSTS: {{ .Values.events.podHosts | quote }}
 STORAGE_EVENTS_POD_PORTS: {{ .Values.events.podPorts | quote }}
+STORAGE_EVENTS_MODEL_NAMES: {{ .Values.events.modelNames | quote }}
 {{- end -}}
 
 {{- define "kv-cache-evictor.configChecksum" -}}

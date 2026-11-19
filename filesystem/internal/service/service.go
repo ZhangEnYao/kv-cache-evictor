@@ -45,8 +45,9 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 		// The deferred Close below waits briefly for those events to leave,
 		// then shuts the socket down.
 		created, err := events.NewPublisher(context.WithoutCancel(ctx), cfg.StorageEventsEndpoint, events.Options{
-			PodHosts: cfg.StorageEventsPodHosts,
-			PodPorts: cfg.StorageEventsPodPorts,
+			PodHosts:   cfg.StorageEventsPodHosts,
+			PodPorts:   cfg.StorageEventsPodPorts,
+			ModelNames: cfg.StorageEventsModelNames,
 		})
 		if err != nil {
 			logger.Warn("Storage event publisher unavailable; continuing without events",
