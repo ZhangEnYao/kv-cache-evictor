@@ -29,6 +29,7 @@ const (
 	DefaultEnableDirCleanup          = true
 	DefaultDirCleanupTTL             = 120 * time.Second
 	DefaultStorageEventsEndpoint     = ""
+	DefaultStorageEventsPodPorts     = "8000"
 
 	// MaxFileQueueSize caps FILE_QUEUE_MAXSIZE. Both queues are Go channels,
 	// and a channel reserves memory for its full size at startup.
@@ -54,6 +55,13 @@ type Config struct {
 	DirCleanupTTL             time.Duration
 	LogFilePath               string
 	StorageEventsEndpoint     string
+	// StorageEventsPodHosts lists host names or IP addresses of the vLLM pods
+	// that use the cache. When set, each BlockRemoved event is published once
+	// per pod, in the form vLLM's own STORAGE events take.
+	StorageEventsPodHosts []string
+	// StorageEventsPodPorts lists the serving ports of each pod, as the
+	// InferencePool's target ports name them.
+	StorageEventsPodPorts []string
 }
 
 func FromEnv() (Config, error) {
@@ -99,6 +107,12 @@ func FromEnvAndFlags(args []string) (Config, error) {
 	logFilePath := flags.String("log-file-path", "", "additional log file path")
 	storageEventsEndpoint := flags.String(
 		"storage-events-endpoint", DefaultStorageEventsEndpoint, "ZMQ endpoint for BlockRemoved events",
+	)
+	storageEventsPodHosts := flags.String(
+		"storage-events-pod-hosts", "", "comma-separated vLLM pod host names or IP addresses to attribute BlockRemoved events to",
+	)
+	storageEventsPodPorts := flags.String(
+		"storage-events-pod-ports", DefaultStorageEventsPodPorts, "comma-separated vLLM serving ports",
 	)
 
 	if err := flags.Parse(args); err != nil {
@@ -213,6 +227,16 @@ func FromEnvAndFlags(args []string) (Config, error) {
 			"STORAGE_EVENTS_ENDPOINT",
 			DefaultStorageEventsEndpoint,
 		),
+		StorageEventsPodHosts: splitList(stringSetting(
+			flags, "storage-events-pod-hosts", *storageEventsPodHosts, "STORAGE_EVENTS_POD_HOSTS", "",
+		)),
+		StorageEventsPodPorts: splitList(stringSetting(
+			flags,
+			"storage-events-pod-ports",
+			*storageEventsPodPorts,
+			"STORAGE_EVENTS_POD_PORTS",
+			DefaultStorageEventsPodPorts,
+		)),
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -308,7 +332,31 @@ func (c *Config) Validate() error {
 	if c.DirCleanupTTL < 0 {
 		return fmt.Errorf("DIR_CLEANUP_TTL_SECONDS must not be negative")
 	}
+	if len(c.StorageEventsPodHosts) > 0 {
+		if c.StorageEventsEndpoint == "" {
+			return fmt.Errorf("STORAGE_EVENTS_POD_HOSTS requires STORAGE_EVENTS_ENDPOINT")
+		}
+		if len(c.StorageEventsPodPorts) == 0 {
+			return fmt.Errorf("STORAGE_EVENTS_POD_PORTS must not be empty when STORAGE_EVENTS_POD_HOSTS is set")
+		}
+		for _, port := range c.StorageEventsPodPorts {
+			if value, err := strconv.Atoi(port); err != nil || value < 1 || value > 65535 {
+				return fmt.Errorf("STORAGE_EVENTS_POD_PORTS must hold ports from 1 to 65535, got %q", port)
+			}
+		}
+	}
 	return nil
+}
+
+// splitList splits a comma-separated setting and drops empty items.
+func splitList(value string) []string {
+	var items []string
+	for item := range strings.SplitSeq(value, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			items = append(items, item)
+		}
+	}
+	return items
 }
 
 func validCrawlerCount(count int) bool {

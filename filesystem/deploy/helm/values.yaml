@@ -87,6 +87,14 @@ events:
   # the llm-d router's kvEventsConfig.zmqEndpoint, use tcp://<host>:<port>.
   endpoint: ""
 
+  # STORAGE_EVENTS_POD_HOSTS. Comma-separated vLLM pod host names or IP
+  # addresses, for example a headless Service for the vLLM pods. When set,
+  # each event is sent once per pod in the form the llm-d router's index
+  # removes. Empty sends events to the kv@SHARED_STORAGE@<model> topic.
+  podHosts: ""
+  # STORAGE_EVENTS_POD_PORTS. Comma-separated vLLM serving ports.
+  podPorts: "8000"
+
   service:
     # Creates a Service and containerPort for the event endpoint in standalone
     # mode. Set endpoint to a matching tcp://...:<port> value. In sidecar

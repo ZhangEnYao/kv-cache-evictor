@@ -10,12 +10,14 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/llm-d-incubation/kv-cache-evictor/filesystem/internal/config"
+	"github.com/llm-d-incubation/kv-cache-evictor/filesystem/internal/events"
 	"github.com/llm-d-incubation/kv-cache-evictor/filesystem/internal/filemeta"
 	"github.com/llm-d-incubation/kv-cache-evictor/filesystem/internal/pending"
 )
@@ -29,7 +31,14 @@ const (
 var metadataRetryDelay = modelMetadataRetryDelay
 
 type EventPublisher interface {
-	PublishBlocksRemoved(ctx context.Context, blockHashes []uint64, modelName string) error
+	PublishBlocksRemoved(ctx context.Context, removed events.BlocksRemoved) error
+}
+
+// eventKey groups the deleted files of one batch into BlockRemoved events.
+type eventKey struct {
+	modelName string
+	groupIdx  int
+	hasGroup  bool
 }
 
 type Deleter struct {
@@ -142,7 +151,7 @@ func (d *Deleter) flush(ctx context.Context, batch []string, folderQueue chan<- 
 		return
 	}
 
-	events := make(map[string][]uint64)
+	removals := make(map[eventKey][]uint64)
 	parents := make(map[string]struct{})
 	// parentModTimes holds the mtime each parent directory had before this
 	// batch deleted anything from it. Deleting a file updates the mtime of its
@@ -209,7 +218,9 @@ func (d *Deleter) flush(ctx context.Context, batch []string, folderQueue chan<- 
 		}
 
 		if d.publisher != nil && blockHashOK && modelNameOK {
-			events[modelName] = append(events[modelName], blockHash)
+			key := eventKey{modelName: modelName}
+			key.groupIdx, key.hasGroup = groupIdxFromPath(path)
+			removals[key] = append(removals[key], blockHash)
 		}
 	}
 
@@ -221,9 +232,19 @@ func (d *Deleter) flush(ctx context.Context, batch []string, folderQueue chan<- 
 		}
 	}
 	if d.publisher != nil {
-		for modelName, hashes := range events {
-			if err := d.publisher.PublishBlocksRemoved(ctx, hashes, modelName); err != nil {
-				logger.Warn("Cannot publish BlockRemoved event", slog.String("model", modelName), slog.Any("error", err))
+		for key, hashes := range removals {
+			err := d.publisher.PublishBlocksRemoved(ctx, events.BlocksRemoved{
+				ModelName:   key.modelName,
+				GroupIdx:    key.groupIdx,
+				HasGroup:    key.hasGroup,
+				BlockHashes: hashes,
+			})
+			if err != nil {
+				logger.Warn("Cannot publish BlockRemoved event",
+					slog.String("model", key.modelName),
+					slog.Int("files", len(hashes)),
+					slog.Any("error", err),
+				)
 			}
 		}
 	}
@@ -316,6 +337,20 @@ func blockHashFromPath(path string) (uint64, bool) {
 		return 0, false
 	}
 	return binary.BigEndian.Uint64(hash[len(hash)-eventHashBytes:]), true
+}
+
+// groupDirPattern matches the <hh>_g<group> directory that holds a cache file.
+var groupDirPattern = regexp.MustCompile(`_g(\d+)$`)
+
+// groupIdxFromPath returns the KV-cache group of a cache file. vLLM's
+// FileMapper stores the file for group g under <hhh>/<hh>_g<g>/.
+func groupIdxFromPath(path string) (int, bool) {
+	match := groupDirPattern.FindStringSubmatch(filepath.Base(filepath.Dir(path)))
+	if match == nil {
+		return 0, false
+	}
+	groupIdx, err := strconv.Atoi(match[1])
+	return groupIdx, err == nil
 }
 
 var rankDirPattern = regexp.MustCompile(`^(.+)_r\d+$`)

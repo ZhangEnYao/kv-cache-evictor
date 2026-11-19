@@ -50,6 +50,8 @@ ENABLE_DIR_CLEANUP: {{ .Values.settings.enableDirCleanup | quote }}
 DIR_CLEANUP_TTL_SECONDS: {{ .Values.settings.dirCleanupTTLSeconds | quote }}
 LOG_FILE_PATH: {{ .Values.settings.logFilePath | quote }}
 STORAGE_EVENTS_ENDPOINT: {{ .Values.events.endpoint | quote }}
+STORAGE_EVENTS_POD_HOSTS: {{ .Values.events.podHosts | quote }}
+STORAGE_EVENTS_POD_PORTS: {{ .Values.events.podPorts | quote }}
 {{- end -}}
 
 {{- define "kv-cache-evictor.configChecksum" -}}

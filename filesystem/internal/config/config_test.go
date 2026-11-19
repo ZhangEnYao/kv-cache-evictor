@@ -303,3 +303,49 @@ func TestValidateRejectsCacheDirectoryOutsidePVC(t *testing.T) {
 		})
 	}
 }
+
+func TestStorageEventsPodSettings(t *testing.T) {
+	t.Setenv("STORAGE_EVENTS_ENDPOINT", "tcp://epp.llm-d.svc:5570")
+	t.Setenv("STORAGE_EVENTS_POD_HOSTS", " vllm-pods.llm-d.svc , 10.0.0.5 ")
+	t.Setenv("STORAGE_EVENTS_POD_PORTS", "8000,8001")
+
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.StorageEventsPodHosts; len(got) != 2 || got[0] != "vllm-pods.llm-d.svc" || got[1] != "10.0.0.5" {
+		t.Fatalf("pod hosts = %q", got)
+	}
+	if got := cfg.StorageEventsPodPorts; len(got) != 2 || got[0] != "8000" || got[1] != "8001" {
+		t.Fatalf("pod ports = %q", got)
+	}
+}
+
+func TestStorageEventsPodPortsDefault(t *testing.T) {
+	t.Setenv("STORAGE_EVENTS_ENDPOINT", "tcp://epp:5570")
+	t.Setenv("STORAGE_EVENTS_POD_HOSTS", "vllm-pods")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.StorageEventsPodPorts; len(got) != 1 || got[0] != "8000" {
+		t.Fatalf("pod ports = %q, want [8000]", got)
+	}
+}
+
+func TestStorageEventsPodSettingsRejected(t *testing.T) {
+	for name, env := range map[string]map[string]string{
+		"hosts without endpoint": {"STORAGE_EVENTS_POD_HOSTS": "vllm-pods"},
+		"bad port":               {"STORAGE_EVENTS_ENDPOINT": "tcp://epp:5570", "STORAGE_EVENTS_POD_HOSTS": "vllm-pods", "STORAGE_EVENTS_POD_PORTS": "http"},
+		"port out of range":      {"STORAGE_EVENTS_ENDPOINT": "tcp://epp:5570", "STORAGE_EVENTS_POD_HOSTS": "vllm-pods", "STORAGE_EVENTS_POD_PORTS": "70000"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			for key, value := range env {
+				t.Setenv(key, value)
+			}
+			if _, err := FromEnv(); err == nil {
+				t.Fatal("settings were accepted")
+			}
+		})
+	}
+}

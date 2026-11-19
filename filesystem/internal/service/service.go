@@ -44,7 +44,10 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 		// the deleter's final flush can still send its BlockRemoved events.
 		// The deferred Close below waits briefly for those events to leave,
 		// then shuts the socket down.
-		created, err := events.NewPublisher(context.WithoutCancel(ctx), cfg.StorageEventsEndpoint)
+		created, err := events.NewPublisher(context.WithoutCancel(ctx), cfg.StorageEventsEndpoint, events.Options{
+			PodHosts: cfg.StorageEventsPodHosts,
+			PodPorts: cfg.StorageEventsPodPorts,
+		})
 		if err != nil {
 			logger.Warn("Storage event publisher unavailable; continuing without events",
 				slog.String("endpoint", cfg.StorageEventsEndpoint), slog.Any("error", err))
@@ -55,7 +58,11 @@ func Run(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 					logger.Warn("Cannot close storage event publisher", slog.Any("error", err))
 				}
 			}()
-			logger.Info("Storage event publisher ready", slog.String("endpoint", cfg.StorageEventsEndpoint))
+			logger.Info("Storage event publisher ready",
+				slog.String("endpoint", cfg.StorageEventsEndpoint),
+				slog.Any("podHosts", cfg.StorageEventsPodHosts),
+				slog.Any("podPorts", cfg.StorageEventsPodPorts),
+			)
 		}
 	}
 

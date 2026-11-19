@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/llm-d-incubation/kv-cache-evictor/filesystem/internal/config"
+	"github.com/llm-d-incubation/kv-cache-evictor/filesystem/internal/events"
 	"github.com/llm-d-incubation/kv-cache-evictor/filesystem/internal/pending"
 )
 
@@ -200,17 +201,19 @@ func TestFlushSkipsFileAccessedSinceQueued(t *testing.T) {
 }
 
 type recordingPublisher struct {
-	hashes map[string][]uint64
+	hashes  map[string][]uint64
+	removed []events.BlocksRemoved
 }
 
-func (p *recordingPublisher) PublishBlocksRemoved(_ context.Context, blockHashes []uint64, modelName string) error {
-	p.hashes[modelName] = append(p.hashes[modelName], blockHashes...)
+func (p *recordingPublisher) PublishBlocksRemoved(_ context.Context, removed events.BlocksRemoved) error {
+	p.hashes[removed.ModelName] = append(p.hashes[removed.ModelName], removed.BlockHashes...)
+	p.removed = append(p.removed, removed)
 	return nil
 }
 
 type panickingPublisher struct{}
 
-func (p *panickingPublisher) PublishBlocksRemoved(context.Context, []uint64, string) error {
+func (p *panickingPublisher) PublishBlocksRemoved(context.Context, events.BlocksRemoved) error {
 	panic("publisher failed")
 }
 
@@ -548,5 +551,59 @@ func TestFlushBatchKeepsFlushSolePendingPathOwner(t *testing.T) {
 
 	if !pendingPaths.Contains(filePath) {
 		t.Fatal("Run's deferred cleanup removed a path requeued after flush released it")
+	}
+}
+
+func TestGroupIdxFromPath(t *testing.T) {
+	for path, want := range map[string]int{
+		"/c/m_r0/fe8/fa_g0/x.bin":  0,
+		"/c/m_r0/fe8/fa_g12/x.bin": 12,
+	} {
+		if got, ok := groupIdxFromPath(path); !ok || got != want {
+			t.Errorf("groupIdxFromPath(%q) = %d, %v; want %d, true", path, got, ok, want)
+		}
+	}
+	for _, path := range []string{"/c/m_r0/fe8/fa/x.bin", "/c/m_r0/fe8/fa_gx/x.bin", "/c/m_r0/fe8_g0/fa/x.bin"} {
+		if _, ok := groupIdxFromPath(path); ok {
+			t.Errorf("groupIdxFromPath(%q) found a group", path)
+		}
+	}
+}
+
+func TestFlushPublishesOneEventPerGroup(t *testing.T) {
+	root := t.TempDir()
+	cachePath := filepath.Join(root, "cache")
+	if err := os.MkdirAll(filepath.Join(cachePath, "model_digest"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cachePath, "model_digest", "config.json"), []byte(`{"model_name":"test-model"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, file := range []string{"abc/de_g0/0000000000000001.bin", "abc/de_g1/0000000000000002.bin", "abc/de_g0/0000000000000003.bin"} {
+		path := filepath.Join(cachePath, "model_digest_r0", file)
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("cache"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, path)
+	}
+
+	publisher := &recordingPublisher{hashes: map[string][]uint64{}}
+	cfg := &config.Config{PVCMountPath: root, CacheDirectory: "cache"}
+	deleter, _ := newTestDeleter(cfg, publisher)
+	deleter.flush(context.Background(), paths, make(chan string, 3), slog.New(slog.DiscardHandler))
+
+	byGroup := map[int][]uint64{}
+	for _, removed := range publisher.removed {
+		if removed.ModelName != "test-model" || !removed.HasGroup {
+			t.Fatalf("event = %+v", removed)
+		}
+		byGroup[removed.GroupIdx] = append(byGroup[removed.GroupIdx], removed.BlockHashes...)
+	}
+	if len(publisher.removed) != 2 || len(byGroup[0]) != 2 || len(byGroup[1]) != 1 || byGroup[1][0] != 2 {
+		t.Fatalf("events = %+v, want group 0 with hashes 1 and 3 and group 1 with hash 2", publisher.removed)
 	}
 }

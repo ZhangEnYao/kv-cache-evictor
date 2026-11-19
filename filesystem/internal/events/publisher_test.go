@@ -3,6 +3,7 @@ package events
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,7 +18,7 @@ func TestPublisherSendsBlockRemovedEvent(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	publisher, err := NewPublisher(ctx, endpoint)
+	publisher, err := NewPublisher(ctx, endpoint, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +34,7 @@ func TestPublisherSendsBlockRemovedEvent(t *testing.T) {
 	}
 	time.Sleep(100 * time.Millisecond)
 
-	if err := publisher.PublishBlocksRemoved(ctx, []uint64{42}, "test-model"); err != nil {
+	if err := publisher.PublishBlocksRemoved(ctx, BlocksRemoved{ModelName: "test-model", BlockHashes: []uint64{42}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -67,7 +68,7 @@ func TestCloseDeliversRecentlyQueuedEvents(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	publisher, err := NewPublisher(ctx, endpoint)
+	publisher, err := NewPublisher(ctx, endpoint, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +94,7 @@ func TestCloseDeliversRecentlyQueuedEvents(t *testing.T) {
 	}()
 
 	for blockHash := range uint64(wantEvents) {
-		if err := publisher.PublishBlocksRemoved(ctx, []uint64{blockHash}, "test-model"); err != nil {
+		if err := publisher.PublishBlocksRemoved(ctx, BlocksRemoved{ModelName: "test-model", BlockHashes: []uint64{blockHash}}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -116,7 +117,7 @@ func TestCloseIsIdempotentAndStopsPublishing(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	publisher, err := NewPublisher(ctx, endpoint)
+	publisher, err := NewPublisher(ctx, endpoint, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +127,7 @@ func TestCloseIsIdempotentAndStopsPublishing(t *testing.T) {
 	if err := publisher.Close(); err != nil {
 		t.Fatalf("second Close returned %v, want nil", err)
 	}
-	if err := publisher.PublishBlocksRemoved(ctx, []uint64{1}, "test-model"); err != nil {
+	if err := publisher.PublishBlocksRemoved(ctx, BlocksRemoved{ModelName: "test-model", BlockHashes: []uint64{1}}); err != nil {
 		t.Fatalf("publish after Close returned %v, want nil", err)
 	}
 }
@@ -220,7 +221,7 @@ func TestPublisherConnectsToBoundSubscriberAndReconnects(t *testing.T) {
 	}
 	endpoint := "tcp://" + subscriber.Addr().String()
 
-	publisher, err := NewPublisher(ctx, endpoint)
+	publisher, err := NewPublisher(ctx, endpoint, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +238,7 @@ func TestPublisherConnectsToBoundSubscriberAndReconnects(t *testing.T) {
 		ticker := time.NewTicker(50 * time.Millisecond)
 		defer ticker.Stop()
 		for {
-			if err := publisher.PublishBlocksRemoved(ctx, []uint64{hash}, "test-model"); err != nil {
+			if err := publisher.PublishBlocksRemoved(ctx, BlocksRemoved{ModelName: "test-model", BlockHashes: []uint64{hash}}); err != nil {
 				t.Fatal(err)
 			}
 			select {
@@ -267,4 +268,92 @@ func TestPublisherConnectsToBoundSubscriberAndReconnects(t *testing.T) {
 		t.Fatal(err)
 	}
 	publishUntilReceived(restarted, 2)
+}
+
+// receive collects messages from subscriber until it has want of them.
+func receive(t *testing.T, ctx context.Context, subscriber zmq4.Socket, want int) []zmq4.Msg {
+	t.Helper()
+	messages := make(chan zmq4.Msg, want)
+	go func() {
+		for range want {
+			message, err := subscriber.Recv()
+			if err != nil {
+				return
+			}
+			messages <- message
+		}
+	}()
+	var got []zmq4.Msg
+	for len(got) < want {
+		select {
+		case message := <-messages:
+			got = append(got, message)
+		case <-ctx.Done():
+			t.Fatalf("received %d messages, want %d", len(got), want)
+		}
+	}
+	return got
+}
+
+func TestPublisherSendsOneStorageEventPerPod(t *testing.T) {
+	endpoint := "inproc://pvc-evictor-per-pod-test"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	publisher, err := NewPublisher(ctx, endpoint, Options{
+		PodHosts: []string{"10.0.0.6", "10.0.0.5"},
+		PodPorts: []string{"8000"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = publisher.Close() }()
+
+	subscriber := zmq4.NewSub(ctx)
+	defer func() { _ = subscriber.Close() }()
+	if err := subscriber.SetOption(zmq4.OptionSubscribe, "kv@"); err != nil {
+		t.Fatal(err)
+	}
+	if err := subscriber.Dial(endpoint); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	removed := BlocksRemoved{ModelName: "Qwen/Qwen3-8B", GroupIdx: 1, HasGroup: true, BlockHashes: []uint64{7, 8}}
+	if err := publisher.PublishBlocksRemoved(ctx, removed); err != nil {
+		t.Fatal(err)
+	}
+
+	messages := receive(t, ctx, subscriber, 2)
+	for i, wantTopic := range []string{"kv@10.0.0.5:8000@Qwen/Qwen3-8B", "kv@10.0.0.6:8000@Qwen/Qwen3-8B"} {
+		if topic := string(messages[i].Frames[0]); topic != wantTopic {
+			t.Fatalf("message %d topic = %q, want %q", i, topic, wantTopic)
+		}
+		event := decodeEvent(t, messages[i].Frames[2])
+		hashes, _ := event[1].([]any)
+		if len(event) != 4 || event[0] != "BlockRemoved" || event[2] != "STORAGE" ||
+			len(hashes) != 2 || hashes[0] != uint64(7) || hashes[1] != uint64(8) {
+			t.Fatalf("message %d event = %#v", i, event)
+		}
+		if group, ok := event[3].(int8); !ok || group != 1 {
+			t.Fatalf("message %d group_idx = %#v, want 1", i, event[3])
+		}
+	}
+}
+
+func TestPublisherRejectsPerPodEventWithoutGroup(t *testing.T) {
+	ctx := context.Background()
+	publisher, err := NewPublisher(ctx, "inproc://pvc-evictor-no-group-test", Options{
+		PodHosts: []string{"10.0.0.5"},
+		PodPorts: []string{"8000"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = publisher.Close() }()
+
+	err = publisher.PublishBlocksRemoved(ctx, BlocksRemoved{ModelName: "m", BlockHashes: []uint64{1}})
+	if !errors.Is(err, ErrNoGroup) {
+		t.Fatalf("error = %v, want ErrNoGroup", err)
+	}
 }

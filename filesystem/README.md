@@ -90,6 +90,8 @@ It exits if either path does not appear.
 | `DIR_CLEANUP_TTL_SECONDS` | `--dir-cleanup-ttl-seconds` | `120` | Quiet period before directory cleanup |
 | `LOG_FILE_PATH` | `--log-file-path` | empty | Additional append-only log file |
 | `STORAGE_EVENTS_ENDPOINT` | `--storage-events-endpoint` | empty | ZMQ endpoint for `BlockRemoved` events |
+| `STORAGE_EVENTS_POD_HOSTS` | `--storage-events-pod-hosts` | empty | Comma-separated vLLM pod host names or IP addresses; enables per-pod events |
+| `STORAGE_EVENTS_POD_PORTS` | `--storage-events-pod-ports` | `8000` | Comma-separated vLLM serving ports (the InferencePool target ports) |
 
 `TARGET_THRESHOLD` must be lower than `CLEANUP_THRESHOLD`. The cache directory must be a relative path below `PVC_MOUNT_PATH`.
 `CLEANUP_THRESHOLD` and `TARGET_THRESHOLD` are percentages of the mounted filesystem’s usable capacity, not of `PVC.spec.resources.requests.storage`.
@@ -99,9 +101,33 @@ It exits if either path does not appear.
 When `STORAGE_EVENTS_ENDPOINT` is set, the service opens a ZMQ PUB socket and publishes events after successful deletions.
 An endpoint with a wildcard host (`tcp://*:5570`, `tcp://0.0.0.0:5570`, `tcp://[::]:5570`) or an `ipc://` or `inproc://` address is bound.
 Any other endpoint, such as `tcp://<router-service>:5570`, is connected to. A connected socket keeps retrying in the background and reconnects after a lost connection; events sent while no peer is connected are dropped.
-The topic is `kv@SHARED_STORAGE@<model-name>`. The model name is read from the model's `config.json` file.
+Without `STORAGE_EVENTS_POD_HOSTS`, the topic is `kv@SHARED_STORAGE@<model-name>` and the event is `["BlockRemoved", [hashes], "SHARED_STORAGE"]`.
+The model name is read from the model's `config.json` file.
 Each removed block is reported by the low 64 bits of the hash in its file name, which are the last 16 hex characters. vLLM names files after the full block hash (64 hex characters for sha256, 32 for xxhash), and its own KV events carry the same low 64 bits when `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=1`, the default.
 If that metadata cannot be read after retries, the service continues deleting files but disables event publishing.
+
+### Routing with the llm-d router
+
+The llm-d router keeps one KV-cache index entry per pod, device tier, and KV-cache group.
+vLLM's file-system offloading tier adds a `storage` entry for its pod when it writes a file, and never removes it.
+A `BlockRemoved` event removes that entry only when it names the same pod, tier, group, and topic model.
+`STORAGE_EVENTS_POD_HOSTS` makes the evictor send events in that form:
+
+- one message per pod and serving port, with the topic `kv@<pod IP>:<port>@<model-name>`, which is the pod name the router's pod discovery uses;
+- the event `["BlockRemoved", [hashes], "STORAGE", <group>]`, where the group comes from the file's `<hh>_g<group>` directory.
+
+Each host in `STORAGE_EVENTS_POD_HOSTS` is either an IP address or a DNS name, resolved for every batch.
+A headless Service name resolves to every ready pod behind it, so a standalone evictor on a shared PVC reaches every pod that may have stored the file.
+A sidecar on a per-pod PVC can set it to its own pod IP.
+Removing an entry that a pod never stored has no effect.
+
+The router only receives the events on a socket that it binds. Set `kvEventsConfig.zmqEndpoint` (for example `tcp://*:5570`) next to `discoverPods: true` in the precise prefix-cache producer, expose that port on the router's Service, and set `STORAGE_EVENTS_ENDPOINT` to it (for example `tcp://<router-service>:5570`).
+
+The topic model is the `model_name` in `config.json`, which holds vLLM's `--model` value. It must equal the model in vLLM's `--kv-events-config` topic, which is the model name the router scores requests with.
+
+A file name holds one event hash, the hash of the last GPU block in the file. `blocks_per_file` in `config.json` is the number of GPU blocks per file.
+The removal matches every `storage` entry of the file when `blocks_per_file` is 1, or when vLLM sends placeholder STORAGE events (`self_describing_kv_events` off, the default), which also carry only that hash.
+With self-describing events and `blocks_per_file` above 1, vLLM's event also lists the other blocks of the file, and their entries stay in the index.
 
 ## Development
 
