@@ -83,7 +83,8 @@ settings:
 events:
   # STORAGE_EVENTS_ENDPOINT. Empty disables event publishing. For network
   # publishing inside Kubernetes, use a ZMQ TCP endpoint such as
-  # tcp://*:5570.
+  # tcp://*:5570, which binds. To connect to a subscriber that binds, such as
+  # the llm-d router's kvEventsConfig.zmqEndpoint, use tcp://<host>:<port>.
   endpoint: ""
 
   service:

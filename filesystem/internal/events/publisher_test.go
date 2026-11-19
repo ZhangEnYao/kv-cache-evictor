@@ -169,3 +169,102 @@ func assertBlockRemovedMessage(t *testing.T, message zmq4.Msg) {
 		t.Fatalf("hashes = %#v, want [42]", event[1])
 	}
 }
+
+func TestIsBindEndpoint(t *testing.T) {
+	for endpoint, want := range map[string]bool{
+		"tcp://*:5570":                   true,
+		"tcp://0.0.0.0:5570":             true,
+		"tcp://[::]:5570":                true,
+		"ipc:///tmp/events":              true,
+		"inproc://events":                true,
+		"tcp://epp.llm-d.svc:5570":       false,
+		"tcp://10.0.0.7:5570":            false,
+		"tcp://epp-0.epp.llm-d.svc:5570": false,
+		"tcp://[fd00::7]:5570":           false,
+	} {
+		if got := isBindEndpoint(endpoint); got != want {
+			t.Errorf("isBindEndpoint(%q) = %v, want %v", endpoint, got, want)
+		}
+	}
+}
+
+func decodeEvent(t *testing.T, payload []byte) []any {
+	t.Helper()
+	var batch []any
+	if err := msgpack.Unmarshal(payload, &batch); err != nil {
+		t.Fatal(err)
+	}
+	rawEvents, ok := batch[1].([]any)
+	if !ok || len(rawEvents) != 1 {
+		t.Fatalf("events = %#v, want one event", batch[1])
+	}
+	event, ok := rawEvents[0].([]any)
+	if !ok {
+		t.Fatalf("event = %T, want []any", rawEvents[0])
+	}
+	return event
+}
+
+// The llm-d router's kvEventsConfig.zmqEndpoint binds, so the evictor must
+// connect to it.
+func TestPublisherConnectsToBoundSubscriberAndReconnects(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	subscriber := zmq4.NewSub(ctx)
+	if err := subscriber.SetOption(zmq4.OptionSubscribe, "kv@"); err != nil {
+		t.Fatal(err)
+	}
+	if err := subscriber.Listen("tcp://127.0.0.1:0"); err != nil {
+		t.Fatal(err)
+	}
+	endpoint := "tcp://" + subscriber.Addr().String()
+
+	publisher, err := NewPublisher(ctx, endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = publisher.Close() }()
+
+	publishUntilReceived := func(sub zmq4.Socket, hash uint64) {
+		t.Helper()
+		got := make(chan zmq4.Msg, 1)
+		go func() {
+			if message, err := sub.Recv(); err == nil {
+				got <- message
+			}
+		}()
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			if err := publisher.PublishBlocksRemoved(ctx, []uint64{hash}, "test-model"); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case message := <-got:
+				hashes, _ := decodeEvent(t, message.Frames[2])[1].([]any)
+				if len(hashes) != 1 || hashes[0] != hash {
+					t.Fatalf("hashes = %v, want [%d]", hashes, hash)
+				}
+				return
+			case <-ticker.C:
+			case <-ctx.Done():
+				t.Fatal("timeout waiting for the connected publisher")
+			}
+		}
+	}
+	publishUntilReceived(subscriber, 1)
+
+	// A router restart: the bound socket goes away and comes back on the
+	// same address.
+	_ = subscriber.Close()
+	restarted := zmq4.NewSub(ctx)
+	defer func() { _ = restarted.Close() }()
+	if err := restarted.SetOption(zmq4.OptionSubscribe, "kv@"); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.Listen(endpoint); err != nil {
+		t.Fatal(err)
+	}
+	publishUntilReceived(restarted, 2)
+}

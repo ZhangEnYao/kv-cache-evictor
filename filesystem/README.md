@@ -97,6 +97,8 @@ It exits if either path does not appear.
 ## Storage events
 
 When `STORAGE_EVENTS_ENDPOINT` is set, the service opens a ZMQ PUB socket and publishes events after successful deletions.
+An endpoint with a wildcard host (`tcp://*:5570`, `tcp://0.0.0.0:5570`, `tcp://[::]:5570`) or an `ipc://` or `inproc://` address is bound.
+Any other endpoint, such as `tcp://<router-service>:5570`, is connected to. A connected socket keeps retrying in the background and reconnects after a lost connection; events sent while no peer is connected are dropped.
 The topic is `kv@SHARED_STORAGE@<model-name>`. The model name is read from the model's `config.json` file.
 Each removed block is reported by the low 64 bits of the hash in its file name, which are the last 16 hex characters. vLLM names files after the full block hash (64 hex characters for sha256, 32 for xxhash), and its own KV events carry the same low 64 bits when `VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=1`, the default.
 If that metadata cannot be read after retries, the service continues deleting files but disables event publishing.
